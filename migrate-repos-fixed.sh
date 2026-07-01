@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Migration script to consolidate repos into learning-artifacts
-# Fixed version: removes .git directories to avoid submodule conflicts
+# Fixed version: removes .git directories and handles empty repos
 # Usage: ./migrate-repos-fixed.sh
 
 set -e
@@ -31,17 +31,45 @@ cd "$WORK_DIR"
 # Step 2: Clone target repo
 echo -e "${YELLOW}📥 Cloning target repository...${NC}"
 if [ -d "$TARGET_REPO" ]; then
-    echo "Target repo already exists, pulling latest..."
+    echo "Target repo already exists, checking for branches..."
     cd "$TARGET_REPO"
-    git pull origin main || git pull origin master
+    # Try to pull, but don't fail if repo is empty
+    git pull origin main 2>/dev/null || git pull origin master 2>/dev/null || echo "No remote branches yet (repo might be empty)"
     cd ..
 else
-    gh repo clone "$GITHUB_USER/$TARGET_REPO"
+    echo "Cloning fresh copy..."
+    gh repo clone "$GITHUB_USER/$TARGET_REPO" 2>/dev/null || {
+        echo -e "${RED}❌ Failed to clone $TARGET_REPO${NC}"
+        exit 1
+    }
 fi
 
 cd "$TARGET_REPO"
 
-# Create directory structure if not exists
+# Check if repo is empty and initialize if needed
+if [ ! -f "README.md" ] && [ -z "$(git ls-remote origin 2>/dev/null)" ]; then
+    echo -e "${YELLOW}📝 Initializing empty repository with README...${NC}"
+    echo "# Learning Artifacts
+
+Consolidated repository for learning materials, experiments, and prototypes organized by topic.
+
+## Structure
+
+- **frontend/**: Frontend frameworks and technologies (Angular, React, Astro, Vanilla JS)
+- **ai-ml/**: AI/ML projects and Streamlit applications
+- **utilities/**: Utility tools and helper projects
+- **experiments/**: Various experimental projects
+
+## Organization
+
+Each subdirectory contains projects organized by technology or topic, with a \`SOURCE.md\` file indicating the original repository source.
+" > README.md
+    git add README.md
+    git commit -m "Initial commit: Setup learning-artifacts repository structure"
+    git push -u origin main 2>/dev/null || git push -u origin master
+fi
+
+# Create directory structure
 echo -e "${YELLOW}📁 Setting up directory structure...${NC}"
 mkdir -p frontend/{angular,react,astro,vanilla-js}
 mkdir -p ai-ml/{streamlit-apps,notebooks,datasets}
@@ -89,7 +117,7 @@ echo -e "${YELLOW}🔄 Migrating repositories...${NC}"
 for migration in "${MIGRATIONS[@]}"; do
     IFS=':' read -r source_repo target_path sub_dir <<< "$migration"
     
-    echo -e "${BLUE}Processing: $source_repo → $target_path/$sub_dir${NC}"
+    echo -e "${BLUE}Processing: $source_repo${NC}"
     
     # Clone the source repo
     if [ -d "$source_repo" ]; then
@@ -106,18 +134,20 @@ for migration in "${MIGRATIONS[@]}"; do
         }
     fi
     
-    # Create target directory and merge content
+    # Create target directory
     target_full_path="$TARGET_REPO/$target_path/$sub_dir"
     mkdir -p "$target_full_path"
     
-    # Copy all files except .git and nested folders
-    echo "  Merging content (removing .git directories)..."
+    # Copy all files (skip .git during copy)
+    echo "  Merging content..."
     
-    # First, copy everything
+    # Copy regular files
     cp -r "$source_repo"/* "$target_full_path/" 2>/dev/null || true
-    cp -r "$source_repo"/.[^.]* "$target_full_path/" 2>/dev/null || true
     
-    # Then remove all .git directories recursively
+    # Copy hidden files except .git
+    find "$source_repo" -maxdepth 1 -type f -name ".*" ! -name ".git" -exec cp {} "$target_full_path/" \; 2>/dev/null || true
+    
+    # Remove all .git directories recursively
     find "$target_full_path" -type d -name ".git" -exec rm -rf {} + 2>/dev/null || true
     
     # Add attribution file
@@ -131,37 +161,45 @@ This folder was migrated from the repository: [\`$GITHUB_USER/$source_repo\`](ht
 All content has been consolidated into the learning-artifacts repository for better organization.
 EOF
     
-    echo -e "${GREEN}✅ $source_repo migrated${NC}"
+    echo -e "${GREEN}✅ Done${NC}"
     echo "Success: $source_repo → $target_path/$sub_dir" >> "$LOG_FILE"
 done
 
 # Step 4: Clean up any remaining .git directories
-echo -e "${YELLOW}🧹 Cleaning up embedded git repositories...${NC}"
+echo -e "${YELLOW}🧹 Final cleanup: removing embedded git repositories...${NC}"
 find "$TARGET_REPO" -type d -name ".git" -exec rm -rf {} + 2>/dev/null || true
 
 # Step 5: Commit to target repo
-echo -e "${YELLOW}💾 Committing changes...${NC}"
+echo -e "${YELLOW}💾 Committing and pushing changes...${NC}"
 cd "$TARGET_REPO"
 
 git add -A
-git commit -m "🚀 Consolidate repositories: Migrate learning projects into organized structure
+
+# Check if there are changes to commit
+if git diff --cached --quiet; then
+    echo "No changes to commit"
+else
+    git commit -m "🚀 Consolidate repositories: Migrate learning projects into organized structure
 
 Migrated repos:
-- Frontend: Angular projects, challenges, experiments
-- AI/ML: Streamlit applications
-- Utilities: Various utility projects
-- Experiments: Other learning projects
+- Frontend: Angular projects, challenges, experiments (4 repos)
+- AI/ML: Streamlit applications (1 repo)
+- Utilities: Various utility projects (8 repos)
+- Experiments: Other learning projects (5 repos)
 
-This consolidation organizes all learning materials into a single repository with logical subdirectories for easier maintenance and discovery." || echo "No changes to commit"
+This consolidation organizes all learning materials into a single repository with logical subdirectories for easier maintenance and discovery."
 
-git push origin main 2>/dev/null || git push origin master || {
-    echo -e "${RED}❌ Failed to push changes${NC}"
-    exit 1
-}
+    # Push to remote
+    echo "Pushing to remote..."
+    git push origin main 2>/dev/null || git push origin master || {
+        echo -e "${RED}❌ Failed to push changes${NC}"
+        exit 1
+    }
+fi
 
 cd ..
 
-echo -e "${GREEN}✅ Changes pushed to $TARGET_REPO${NC}"
+echo -e "${GREEN}✅ Changes committed and pushed${NC}"
 
 # Step 6: Summary and cleanup instructions
 echo -e "${BLUE}📊 Migration Summary${NC}"
@@ -170,17 +208,16 @@ cat "$LOG_FILE"
 echo "=========================="
 
 echo -e "${YELLOW}📝 Next Steps:${NC}"
-echo "1. Verify all content in: https://github.com/$GITHUB_USER/$TARGET_REPO"
-echo "2. Update any documentation or links pointing to old repos"
-echo "3. Delete old repositories using:"
+echo "1. ✅ Verify all content at: https://github.com/$GITHUB_USER/$TARGET_REPO"
+echo ""
+echo "2. Delete old repositories when ready:"
 echo ""
 for migration in "${MIGRATIONS[@]}"; do
     IFS=':' read -r source_repo _ _ <<< "$migration"
     echo "   gh repo delete $GITHUB_USER/$source_repo --confirm"
 done
 echo ""
-echo "4. Clean up workspace: rm -rf $WORK_DIR"
-echo "5. Verify directory structure:"
-echo "   tree $TARGET_REPO/ -L 3"
+echo "3. Clean up local workspace:"
+echo "   cd .. && rm -rf $WORK_DIR"
 
 echo -e "${GREEN}✨ Migration complete!${NC}"
